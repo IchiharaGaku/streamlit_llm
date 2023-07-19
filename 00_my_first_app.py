@@ -2,18 +2,13 @@ import os
 import openai
 import streamlit as st
 from dotenv import load_dotenv
+from langchain.llms import OpenAI
 from langchain.chat_models import ChatOpenAI
-from langchain.schema import (
-    SystemMessage,
-    HumanMessage,
-    AIMessage
-)
-from streamlit_chat import message
 from langchain.callbacks import get_openai_callback
-
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from langchain.prompts import PromptTemplate
+from langchain.chains.summarize import load_summarize_chain
+from langchain.document_loaders import YoutubeLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 load_dotenv()
 
@@ -24,23 +19,18 @@ def init_page():
         page_title="Private ChatGPT",
         page_icon="🥺"
     )
-    st.header("Private ChatGPT")
+    st.header("Youtube Summarizer")
     st.sidebar.title("Options")
-
-def init_messages():
-    clear_button = st.sidebar.button("Clear Options", key="Clear")
-    if clear_button or "messages" not in st.session_state:
-        st.session_state.messages = [
-            SystemMessage(content="You are a helpful assistant.")
-        ]
-        st.session_state.costs = []
+    st.session_state.costs = []
 
 def select_model():
-    model = st.sidebar.radio("Choose a model:", ("GPT-3.5", "GPT-4"))
+    model = st.sidebar.radio("Choose a model:", ("GPT-3.5", "GPT-3.5-16k", "GPT-4"))
     if model == "GPT-3.5":
-        model_name = "gpt-3.5-turbo"
+        st.session_state.model_name = "gpt-3.5-turbo-0613"
+    elif model == "GPT-3.5-16k":
+        st.session_state.model_name = "gpt-3.5-turbo-16k-0613"
     else:
-        model_name = "gpt-4"
+        st.session_state.model_name = "gpt-4"
     
     temperature = st.sidebar.slider(
         "Temperature:",
@@ -50,101 +40,83 @@ def select_model():
         step=0.01
     )
 
-    return ChatOpenAI(temperature=temperature, model_name=model_name)
+    st.session_state.max_token = OpenAI.modelname_to_contextsize(st.session_state.model_name) - 300
+
+    return ChatOpenAI(temperature=temperature, model_name=st.session_state.model_name)
 
 def get_url_input():
-    url = st.text_input("URL: ", key="input")
+    url = st.text_input("YouTube URL: ", key="input")
     return url
-
-def validate_url(url):
-    try:
-        result = urlparse(url)
-        return all([result.scheme, result.netloc])
-    except ValueError:
-      return False
     
-def get_content(url):
-    try:
-        with st.spinner("Fetching Content ..."):
-            response = requests.get(url)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            if soup.main:
-                return soup.main.get_text()
-            elif soup.article:
-                return soup.article.get_text()
-            else:
-                return soup.body.get_text()
-    except:
-        st.write('something wrong')
-        return None
+def get_document(url):
+    with st.spinner("Fetching Content ..."):
+        loader = YoutubeLoader.from_youtube_url(
+            url,
+            add_video_info=True,
+            language=['en', 'ja']
+        )
+        text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            model_name=st.session_state.model_name,
+            chunk_size=st.session_state.max_token,
+            chunk_overlap=0,
+        )
+        return loader.load_and_split(text_splitter=text_splitter)
+            
     
-def build_prompt(content, n_chars=300):
-    return f"""以下はとある。Webページのコンテンツである。内容を{n_chars}程度でわかりやすく要約してください。
+def summarize(llm, docs):
+    prompt_template = """Write a Japanese summary of the following transcript of Youtube Video.
 
-========
+    {text}
 
-{content[:1000]}
+    ここから日本語で書いてね:
+    """
 
-========
+    PROMPT = PromptTemplate(template=prompt_template, input_variables=["text"])
 
-日本語で書いてね！"""
-
-def get_answer(llm, messages):
     with get_openai_callback() as cb:
-        answer = llm(messages)
-    return answer.content, cb.total_cost
+        chain = load_summarize_chain(
+            llm,
+            chain_type="map_reduce",
+            verbose=True,
+            map_prompt=PROMPT,
+            combine_prompt=PROMPT
+        )
+        response = chain(
+            {
+                "input_documents": docs,
+                "token_max": st.session_state.max_token
+            },
+            return_only_outputs=True)
+        print(response)
+        print(response['output_text'])
+    
+    return response['output_text'], cb.total_cost
 
 def main():
     init_page()
 
     llm = select_model()
-    init_messages()
 
     container = st.container()
     response_container = st.container()
 
     with container:
         url = get_url_input()
-        is_valid_url = validate_url(url)
-        if not is_valid_url:
-            st.write('Please input valid url')
-            answer = None
+        if url:
+            document = get_document(url)
+            with st.spinner("Customize GPT is typing ..."):
+                output_text, cost = summarize(llm, document)
+            st.session_state.costs.append(cost)
         else:
-            content = get_content(url)
-            if content:
-                prompt = build_prompt(content)
-                st.session_state.messages.append(HumanMessage(content=prompt))
-                with st.spinner("Private GPT is typing ..."):
-                    answer, cost = get_answer(llm, st.session_state.messages)
-                st.session_state.costs.append(cost)
-            else:
-                answer = None
-    
-    if answer:
+            output_text = None
+  
+    if output_text:
         with response_container:
             st.markdown("## Summary")
-            st.write(answer)
+            st.write(output_text)
             st.markdown("---")
             st.markdown("## Original Text")
-            st.write(content)
-    
-    # if user_input := st.chat_input("聞きたいことを入力してね！"):
-    #     st.session_state.messages.append(HumanMessage(content=user_input))
-    #     with st.spinner("ChatGPT is typing ..."):
-    #         answer, cost = get_answer(llm, st.session_state.messages)
-    #     st.session_state.messages.append(AIMessage(content=answer))
-    #     st.session_state.costs.append(cost)
-    
-    # messages = st.session_state.get('messages', [])
-    # for message in messages:
-    #     if isinstance(message, AIMessage):
-    #         with st.chat_message('assistant'):
-    #             st.markdown(message.content)
-    #     elif isinstance(message, HumanMessage):
-    #         with st.chat_message('user'):
-    #             st.markdown(message.content)
-    #     else:
-    #         st.write(f"System message: {message.content}")
+            st.write(document)
     
     costs = st.session_state.get('costs', [])
     st.sidebar.markdown("## Costs")
